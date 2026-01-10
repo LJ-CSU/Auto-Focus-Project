@@ -1,10 +1,12 @@
 import os
 import numpy as np
 import cv2
-import matplotlib.pyplot as plt
+import random
 
-alpha = 4.0
-defocus_levels = [-11, -9, -7, -5, -3, -1, 0, 1, 3, 5, 7, 9, 11] #最大 PSF 半径 ≈ 图像中等结构尺寸的 1/3～1/2
+# --- 增强参数配置 ---
+# 调大 alpha 确保 256x256 下仍有明显模糊感
+ALPHA_RANGE = (5.0, 8.0)
+DEFOCUS_LEVELS = [-11, -9, -7, -5, -3, -1, 0, 1, 3, 5, 7, 9, 11]
 
 def load_images(folder_path):
 
@@ -23,55 +25,90 @@ def load_images(folder_path):
 
     return images
 
-def disk_psf(radius):
 
+def disk_psf_advanced(radius, z):
+    """
+    带物理非对称性的 PSF 生成
+    """
+    # 确保 size 始终为奇数，利于中心对称
     size = int(2 * radius + 1)
-    y, x = np.ogrid[-radius:radius+1, -radius:radius+1]
-    mask = x**2 + y**2 <= radius**2
+    if size % 2 == 0:
+        size += 1
+
+    if size < 3:
+        psf = np.zeros((3, 3), dtype=np.float32)
+        psf[1, 1] = 1.0
+        return psf
+
+    # 使用 size 直接生成坐标轴，确保形状与 psf 矩阵完全一致
+    center = (size - 1) / 2
+    y, x = np.indices((size, size))
+    dist_sq = (x - center) ** 2 + (y - center) ** 2
+
+    mask = dist_sq <= radius ** 2
     psf = np.zeros((size, size), dtype=np.float32)
-    psf[mask] = 1.0
-    psf /= psf.sum()
+
+    if z >= 0:
+        # 正离焦：均匀分布
+        psf[mask] = 1.0
+    else:
+        # 负离焦：模拟球差 (Spherical Aberration)
+        # 边缘亮度高于中心，打破视觉对称性
+        # 避免半径为 0 导致除以 0
+        safe_radius_sq = max(radius ** 2, 1e-6)
+        edge_weight = np.exp(dist_sq / (2 * safe_radius_sq))
+        psf[mask] = edge_weight[mask]
+
+    # 防止全黑或全零的情况
+    sum_val = psf.sum()
+    if sum_val == 0:
+        psf[int(center), int(center)] = 1.0
+    else:
+        psf /= sum_val
+
     return psf
 
 
-def apply_psf(image, psf):
+def apply_blur_with_noise(image, z, alpha):
+    """
+    卷积并添加轻微噪声，模拟真实传感器特性
+    """
+    if z == 0:
+        return image
 
-    return cv2.filter2D(image, -1, psf)
+    radius = alpha * abs(z)
+    psf = disk_psf_advanced(radius, z)
+
+    # 卷积
+    blurred = cv2.filter2D(image, -1, psf)
+
+    # 添加极微量的噪声，防止网络过拟合理想卷积
+    noise = np.random.normal(0, 0.002, blurred.shape).astype(np.float32)
+    blurred = np.clip(blurred + noise, 0, 1)
+
+    return blurred
 
 
-def blur_rgb(image, psf):
+def process_and_save():
+    source_images = load_images('./PSF_Source_data')
+    base_dir = './datasets/train'
 
-    return np.stack(
-        [apply_psf(image[:, :, c], psf) for c in range(3)],
-        axis=2
-    )
+    for i, img in enumerate(source_images):
+        scene_dir = os.path.join(base_dir, f'scene_{i + 1:04d}')
+        os.makedirs(scene_dir, exist_ok=True)
+
+        # 每个场景随机一个 alpha，让网络学习“相对关系”而非“固定像素半径”
+        current_alpha = random.uniform(*ALPHA_RANGE)
+
+        for z in DEFOCUS_LEVELS:
+            blurred = apply_blur_with_noise(img, z, current_alpha)
+
+            # 转为 uint8 保存
+            blurred_uint8 = (blurred * 255.0).clip(0, 255).astype(np.uint8)
+            blurred_bgr = cv2.cvtColor(blurred_uint8, cv2.COLOR_RGB2BGR)
+
+            cv2.imwrite(os.path.join(scene_dir, f'img_z{z}.png'), blurred_bgr)
 
 
 if __name__ == "__main__":
-    images = load_images('./PSF_Source_data')
-    num_pic = len(images)
-    base_dir = './datasets/train'
-    for i in range(1, num_pic + 1):
-        img = images[i-1]
-        folder_name = f'scene_{i:04d}'
-        scene_dir = os.path.join(base_dir, folder_name)
-        os.makedirs(scene_dir, exist_ok=True)
-        for z in defocus_levels:
-            if z == 0:
-                blurred = img.copy()
-            else:
-                r = int(alpha * abs(z))
-                psf = disk_psf(r)
-                blurred = blur_rgb(img, psf)
-
-            # ---------- 保存前处理 ----------
-            blurred_uint8 = np.clip(blurred * 255.0, 0, 255).astype(np.uint8)
-
-            # RGB → BGR（cv2.imwrite 要求）
-            blurred_uint8 = cv2.cvtColor(blurred_uint8, cv2.COLOR_RGB2BGR)
-            pic_path = os.path.join(scene_dir, f'img_z{z}.png')
-            cv2.imwrite(
-                pic_path,
-                blurred_uint8
-            )
-
+    process_and_save()

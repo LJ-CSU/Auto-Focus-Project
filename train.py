@@ -11,11 +11,11 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(f'device: {device}')
 
 # 设置超参数
-epochs = 20
+epochs = 10
 learn_rate = 1e-4
-w_rank = 0.5
-w_smooth = 0.0
-w_uni = 0.0
+w_rank = 1.0
+w_smooth = 0.8
+w_uni = 0.5
 
 # 设置模型，优化器
 model = ResNetDefocus(pretrained=True).to(device)
@@ -23,25 +23,31 @@ optimizer = torch.optim.Adam(model.parameters(), lr=learn_rate)
 
 # 创建数据集
 transform = transforms.Compose([
-    transforms.Resize((256, 256)),
     transforms.ToTensor(),
+    # transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
 
 train_dataset = DefocusSceneDataset(
     root_dir="./datasets/train",
     transform=transform,
-    k=None  # 使用所有图片
+    is_train=True #是训练集
 )
+
 validate_dataset = DefocusSceneDataset(
+    root_dir="./datasets/validate",
+    transform=transform,
+)
+
+test_dataset = DefocusSceneDataset(
     root_dir="./datasets/test",
     transform=transform,
-    k=None
 )
 
 # 创建数据加载器
 train_dataloader = DataLoader(train_dataset, batch_size=1, shuffle=True)
 validate_dataloader = DataLoader(validate_dataset, batch_size=1)
+test_dataloader = DataLoader(test_dataset, batch_size=1)
 
 # 训练函数
 def train(epoch):
@@ -79,7 +85,7 @@ def train(epoch):
 for epoch in range(1, epochs + 1):
     train(epoch)
     if epoch % 5 == 0:
-        images, focus_pos = next(iter(validate_dataloader))
+        images, focus_pos = next(iter(test_dataloader))
         images = images.squeeze(0)
         focus_pos = focus_pos.squeeze(0)
         eval_defocus_curve(
