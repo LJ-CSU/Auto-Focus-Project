@@ -1,27 +1,31 @@
 import torch
+import torch.nn.functional as F
 from models.resnet_defocus import ResNetDefocus
-from loss import defocus_total_loss, DifferentiableBlurLayer
+from loss import defocus_total_loss, DifferentiableBlurLayer, ranking_loss
 from focal_stack_dataset import DefocusSceneDataset
 from torchvision import transforms
 from torch.utils.data import DataLoader
 from eval import eval_defocus_curve
+import torch.optim as optim
 
 # 设置设备
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(f'device: {device}')
 
 # 设置超参数
-epochs = 20
+epochs = 50
 learn_rate = 1e-4
 w_radii = 10.0
-w_rank = 1.0    # 强制学习模糊程度的顺序
+w_rank = 3.0    # 强制学习模糊程度的顺序
 w_smooth = 0.1  # 保证曲线平滑
 w_uni = 0.1     # 保证单峰性
 w_recon = 0.0   # 重构权重，按需使用，仅作为辅助正则项
+NORM_FACTOR = 100.0
 
 # 设置模型，优化器
 model = ResNetDefocus(pretrained=True).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=learn_rate)
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5)
 
 # 设置PSF约束
 blur_layer = DifferentiableBlurLayer(kernel_size=31).to(device)
@@ -34,7 +38,7 @@ transform = transforms.Compose([
 ])
 
 train_dataset = DefocusSceneDataset(
-    root_dir="./datasets/train_aug",
+    root_dir="./datasets/train_DIV2K_50",
     transform=transform,
     is_train=True #是训练集
 )
@@ -99,11 +103,67 @@ def train(epoch):
         f"Avg Loss = {loss_epoch / len(train_dataloader):.4f}"
     )
 
+
+def validate(epoch):
+    model.eval()  # 切换到评估模式 (关闭 Dropout, 锁定 BatchNorm)
+
+    total_loss_meter = 0.0
+    mae_meter = 0.0  # Mean Absolute Error (平均绝对误差)
+    steps = 0
+
+    # 验证阶段必须关闭梯度计算，节省显存并加速
+    with torch.no_grad():
+        for batch_idx, (images, gt_radii, focus_pos) in enumerate(validate_dataloader):
+
+            # 1. 数据搬运
+            images = images.squeeze(0).to(device)  # Shape: (K, 3, 256, 256)
+            gt_radii = gt_radii.squeeze(0).to(device)  # Shape: (K,)
+            focus_pos = focus_pos.squeeze(0).to(device)  # Shape: (K,)
+
+            # 2. 前向传播
+            # ResNet 输出是 (K, 1)，需要 squeeze 成 (K,) 与 gt_radii 对齐
+            pred_radii = model(images).squeeze(1)
+
+            # 3. 计算验证损失
+            # 主要关注 MSE (准确度)，Ranking Loss 仅作参考
+            # 与训练 Loss 保持量级一致（防止 Scheduler 误判），保留少量 Rank 权重
+            loss_mse = F.mse_loss(pred_radii, gt_radii)
+            loss_rank = ranking_loss(pred_radii, focus_pos)
+            val_loss = loss_mse + 0.1 * loss_rank
+
+            # 4. 统计指标
+            total_loss_meter += val_loss.item()
+
+            # 计算 MAE (归一化后的误差，0.0-1.0)
+            batch_mae = torch.abs(pred_radii - gt_radii).mean().item()
+            mae_meter += batch_mae
+
+            steps += 1
+
+    # 计算 Epoch 平均值
+    avg_loss = total_loss_meter / steps
+    avg_mae = mae_meter / steps
+
+    # 将误差还原回物理像素，比如 MAE=0.05, 乘以 100 后，表示平均预测误差是 5 个像素
+    real_pixel_error = avg_mae * NORM_FACTOR
+
+    print(f"\n[Validation] Epoch {epoch} Report:")
+    print(f"  > Avg Loss : {avg_loss:.6f} (用于调度器)")
+    print(f"  > Avg MAE  : {avg_mae:.6f} (归一化后)")
+    print(f"  > Real Err : {real_pixel_error:.2f} pixels (真实物理误差)")
+
+    return avg_loss
+
 # 训练过程
 for epoch in range(1, epochs + 1):
     train(epoch)
+    val_loss = validate(epoch)
+    scheduler.step(val_loss)
+    current_lr = optimizer.param_groups[0]['lr']
+    print(f"Epoch {epoch} | Current LR: {current_lr}")
+
     if epoch % 5 == 0:
-        images, _, focus_pos = next(iter(validate_dataloader))
+        images, _, focus_pos = next(iter(test_dataloader))
         images = images.squeeze(0)
         focus_pos = focus_pos.squeeze(0)
         eval_defocus_curve(
