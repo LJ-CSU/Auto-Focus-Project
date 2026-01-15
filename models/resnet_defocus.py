@@ -16,7 +16,10 @@ class ResNetDefocus(nn.Module):
 
         # Remove classification head
         self.encoder = nn.Sequential(*list(backbone.children())[:-1])  # GAP included
-        self.regressor = nn.Linear(512, 1)
+        self.regressor = nn.Sequential(
+            nn.Linear(512, 1),
+            nn.Softplus()   # 确保输出为正且梯度平滑
+        )
 
     def forward(self, x):
         feat = self.encoder(x)          # (B, 512, 1, 1)

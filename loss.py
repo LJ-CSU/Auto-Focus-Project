@@ -1,5 +1,53 @@
 import torch
 import torch.nn.functional as F
+import torch.nn as nn
+
+# --- 可微模糊层：放在 loss.py 中方便调用 ---
+class DifferentiableBlurLayer(nn.Module):
+    def __init__(self, kernel_size=31):
+        super().__init__()
+        self.kernel_size = kernel_size
+        # 生成坐标网格 [-1, 1]
+        range_vec = torch.linspace(-1, 1, kernel_size)
+        y, x = torch.meshgrid(range_vec, range_vec, indexing='ij')
+        self.register_buffer('grid', x ** 2 + y ** 2)  # 存储距离平方
+
+    def forward(self, x, radius_normalized):
+        """
+        x: 清晰图像 (B, 3, H, W)
+        radius_normalized: 预测的模糊半径 (B,)
+        """
+        B, C, H, W = x.shape
+        # 使用 Sigmoid 模拟硬边缘，使其可微。temperature 越小越接近硬圆盘
+        temperature = 0.1
+        # radius_normalized 需要映射到 [0, 1]
+        kernels = torch.sigmoid((radius_normalized.view(B, 1, 1) - torch.sqrt(self.grid)) / temperature)
+
+        # 归一化内核
+        kernels = kernels / (kernels.sum(dim=(1, 2), keepdim=True) + 1e-8)
+
+        # 组卷积实现 Batch 内不同图片用不同内核
+        x_reshaped = x.reshape(1, B * C, H, W)
+        kernels = kernels.reshape(B, 1, 1, self.kernel_size, self.kernel_size)
+        kernels = kernels.repeat(1, C, 1, 1, 1).reshape(B * C, 1, self.kernel_size, self.kernel_size)
+
+        out = F.conv2d(x_reshaped, kernels, groups=B * C, padding=self.kernel_size // 2)
+        return out.view(B, C, H, W)
+
+# --- SSIM 损失函数 ---
+def ssim_loss(img1, img2, window_size=11):
+    C1, C2 = 0.01 ** 2, 0.03 ** 2
+    mu1 = F.avg_pool2d(img1, window_size, stride=1, padding=window_size // 2)
+    mu2 = F.avg_pool2d(img2, window_size, stride=1, padding=window_size // 2)
+    mu1_sq, mu2_sq, mu1_mu2 = mu1.pow(2), mu2.pow(2), mu1 * mu2
+
+    sigma1_sq = F.avg_pool2d(img1 * img1, window_size, stride=1, padding=window_size // 2) - mu1_sq
+    sigma2_sq = F.avg_pool2d(img2 * img2, window_size, stride=1, padding=window_size // 2) - mu2_sq
+    sigma12 = F.avg_pool2d(img1 * img2, window_size, stride=1, padding=window_size // 2) - mu1_mu2
+
+    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / \
+               ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+    return 1 - ssim_map.mean()
 
 def ranking_loss(pred, focus_pos):
     """
@@ -101,27 +149,34 @@ def smoothness_loss_v2(pred, focus_pos):
     return l1_smooth + l2_smooth
 
 
-def defocus_total_loss(pred, focus_pos,
+def defocus_total_loss(pred, focus_pos, recon_img, target_img,
                        w_rank=1.0,
                        w_smooth=0.8,
-                       w_uni=0.5):
+                       w_uni=0.5,
+                       w_recon=2.0,
+                       recon_type='ssim'):
     """
     组合损失函数
     """
     l_rank = ranking_loss(pred, focus_pos)
     l_smooth = smoothness_loss_v2(pred, focus_pos)
     l_uni = unimodal_loss(pred, focus_pos)
-    l_anchor = anchor_loss(pred, focus_pos)
+
+    if recon_type == 'ssim':
+        l_recon = ssim_loss(recon_img, target_img)
+    else:
+        l_recon = F.mse_loss(recon_img, target_img)
 
     total = (
             w_rank * l_rank +
             w_smooth * l_smooth +
-            w_uni * l_uni
+            w_uni * l_uni +
+            w_recon * l_recon
     )
 
     return total, {
         'rank': l_rank.item(),
         'smooth': l_smooth.item(),
         'unimodal': l_uni.item(),
-        'anchor': l_anchor.item()
+        'recon': l_recon.item()
     }
