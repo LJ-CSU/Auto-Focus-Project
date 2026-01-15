@@ -15,12 +15,12 @@ def eval_defocus_curve(model, images, focus_pos, save_path=None):
     focus_pos = focus_pos.to(images.device)
 
     # forward
-    pred = model(images).squeeze(1)  # (k,)
+    pred_radii = model(images).squeeze(1)  # (k,)
 
-    # sort by focus position (important!)
+    # sort by focus position
     idx = torch.argsort(focus_pos)
     focus_sorted = focus_pos[idx].cpu().numpy()
-    pred_sorted = pred[idx].cpu().numpy()
+    pred_sorted = pred_radii[idx].cpu().numpy()
 
     # plot
     plt.figure(figsize=(6, 4))

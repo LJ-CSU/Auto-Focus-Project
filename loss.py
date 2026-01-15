@@ -149,18 +149,20 @@ def smoothness_loss_v2(pred, focus_pos):
     return l1_smooth + l2_smooth
 
 
-def defocus_total_loss(pred, focus_pos, recon_img, target_img,
+def defocus_total_loss(pred_radii, gt_radii, focus_pos, recon_img, target_img,
+                       w_radii=10.0,
                        w_rank=1.0,
-                       w_smooth=0.8,
-                       w_uni=0.5,
-                       w_recon=2.0,
+                       w_smooth=0.0,
+                       w_uni=0.0,
+                       w_recon=0.0,
                        recon_type='ssim'):
     """
     组合损失函数
     """
-    l_rank = ranking_loss(pred, focus_pos)
-    l_smooth = smoothness_loss_v2(pred, focus_pos)
-    l_uni = unimodal_loss(pred, focus_pos)
+    l_rank = ranking_loss(pred_radii, focus_pos)
+    l_smooth = smoothness_loss_v2(pred_radii, focus_pos)
+    l_uni = unimodal_loss(pred_radii, focus_pos)
+    l_radii = F.mse_loss(pred_radii, gt_radii)
 
     if recon_type == 'ssim':
         l_recon = ssim_loss(recon_img, target_img)
@@ -168,6 +170,7 @@ def defocus_total_loss(pred, focus_pos, recon_img, target_img,
         l_recon = F.mse_loss(recon_img, target_img)
 
     total = (
+            w_radii * l_radii +
             w_rank * l_rank +
             w_smooth * l_smooth +
             w_uni * l_uni +
@@ -175,6 +178,7 @@ def defocus_total_loss(pred, focus_pos, recon_img, target_img,
     )
 
     return total, {
+        'radii': l_radii.item(),
         'rank': l_rank.item(),
         'smooth': l_smooth.item(),
         'unimodal': l_uni.item(),

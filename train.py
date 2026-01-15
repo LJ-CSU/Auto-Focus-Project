@@ -11,12 +11,13 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(f'device: {device}')
 
 # 设置超参数
-epochs = 10
+epochs = 20
 learn_rate = 1e-4
-w_rank = 0.0
-w_smooth = 0.0
-w_uni = 0.0
-w_recon = 5.0
+w_radii = 10.0
+w_rank = 1.0    # 强制学习模糊程度的顺序
+w_smooth = 0.1  # 保证曲线平滑
+w_uni = 0.1     # 保证单峰性
+w_recon = 0.0   # 重构权重，按需使用，仅作为辅助正则项
 
 # 设置模型，优化器
 model = ResNetDefocus(pretrained=True).to(device)
@@ -33,13 +34,13 @@ transform = transforms.Compose([
 ])
 
 train_dataset = DefocusSceneDataset(
-    root_dir="./datasets/train",
+    root_dir="./datasets/train_aug",
     transform=transform,
     is_train=True #是训练集
 )
 
 validate_dataset = DefocusSceneDataset(
-    root_dir="./datasets/self_val",
+    root_dir="./datasets/validate",
     transform=transform,
 )
 
@@ -57,24 +58,26 @@ test_dataloader = DataLoader(test_dataset, batch_size=1)
 def train(epoch):
     loss_epoch = 0.0
     model.train()
-    for batch_idx, (images, focus_pos) in enumerate(train_dataloader):
+    for batch_idx, (images, gt_radii, focus_pos) in enumerate(train_dataloader):
         """
         images.shape: (batch_size, k, 3, H, W)
         focus_pos.shape: (batch_size, k)
         """
         images = images.squeeze(0).to(device)        # (k, 3, H, W)
+        gt_radii = gt_radii.squeeze(0).to(device)    # (k,)
         focus_pos = focus_pos.squeeze(0).to(device)  # (k,)
 
-        # 前向预测
-        pred = model(images).squeeze(1)  # (k,)
+        # 前向预测 (预测归一化半径)
+        pred_radii = model(images).squeeze(1)  # (k,)
 
         # PSF重构
         z0_idx = torch.argmin(torch.abs(focus_pos))
         img_clear = images[z0_idx:z0_idx + 1].expand(images.size(0), -1, -1, -1).clone()
-        pred_radii = pred * 1.0 + 1e-4 #增加一个小的偏移量 (EPS)，防止半径完全为 0
+        pred_radii = pred_radii + 1e-4 #增加一个小的偏移量 (EPS)，防止半径完全为 0
         recon_images = blur_layer(img_clear, pred_radii)
 
-        loss,loss_dict = defocus_total_loss(pred, focus_pos, recon_images, images, w_rank, w_smooth, w_uni, w_recon)
+        loss,loss_dict = defocus_total_loss(pred_radii, gt_radii, focus_pos, recon_images, images,
+                                            w_radii, w_rank, w_smooth, w_uni, w_recon)
         loss_epoch += loss.item()
 
         optimizer.zero_grad()
@@ -84,6 +87,7 @@ def train(epoch):
             f"Epoch[{epoch}] "
             f"[{batch_idx+1}/{len(train_dataloader)}] "
             f"Loss={loss.item():.4f} | "
+            f"Radii_Loss={loss_dict['radii']:.4f} "
             f"Rank={loss_dict['rank']:.4f} "
             f"Smooth={loss_dict['smooth']:.4f} "
             f"Uni={loss_dict['unimodal']:.4f} "
@@ -99,7 +103,7 @@ def train(epoch):
 for epoch in range(1, epochs + 1):
     train(epoch)
     if epoch % 5 == 0:
-        images, focus_pos = next(iter(validate_dataloader))
+        images, _, focus_pos = next(iter(validate_dataloader))
         images = images.squeeze(0)
         focus_pos = focus_pos.squeeze(0)
         eval_defocus_curve(

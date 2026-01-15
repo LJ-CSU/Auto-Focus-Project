@@ -1,9 +1,10 @@
 import os
+import re
 from PIL import Image
 import torch
 from torch.utils.data import Dataset
+import torchvision.transforms.functional as TF
 import torchvision.transforms as transforms  # 用于获取 get_params
-import torchvision.transforms.functional as TF  # 用于执行同步变换
 import random
 
 
@@ -12,19 +13,19 @@ class DefocusSceneDataset(Dataset):
         self.root_dir = root_dir
         self.transform = transform
         self.scenes = sorted(os.listdir(root_dir))
-        self.is_train = is_train  # 增加训练模式标志
+        self.is_train = is_train
 
     def __len__(self):
         return len(self.scenes)
 
     def __getitem__(self, idx):
         scene_path = os.path.join(self.root_dir, self.scenes[idx])
-        files = sorted(os.listdir(scene_path))
+        files = sorted(os.listdir(scene_path), key=lambda x: int(re.search(r'z(-?\d+)', x).group(1)))
 
         images = []
-        focus_pos = []
+        radii = []  # 半径标签
+        focus_pos = []  # 离焦位置标签，用于排序或绘图
 
-        # 尺寸变换参数
         target_size = (256, 256)
 
         if self.is_train:
@@ -39,10 +40,15 @@ class DefocusSceneDataset(Dataset):
             do_flip = random.random() > 0.5
 
         for fname in files:
-            z = int(fname.split('z')[-1].split('.')[0])
-            img = Image.open(os.path.join(scene_path, fname)).convert('RGB')
+            # 解析 z 和 radius
+            # 训练图像文件名示例: img_z5_r32.50.png
+            # 验证/测试文件名示例： img_z5.png
+            z_match = re.search(r'z(-?\d+)', fname)
+            z = int(z_match.group(1)) if z_match else 0
+            r_match = re.search(r'r(\d+\.?\d*)', fname)
+            r = float(r_match.group(1)) if r_match else 0.0
 
-            # 基础预处理：先统一大小
+            img = Image.open(os.path.join(scene_path, fname)).convert('RGB')
             img = TF.resize(img, target_size)
 
             if self.is_train:
@@ -57,6 +63,13 @@ class DefocusSceneDataset(Dataset):
                 img = self.transform(img)
 
             images.append(img)
+            radii.append(r)
             focus_pos.append(z)
 
-        return torch.stack(images), torch.tensor(focus_pos)
+        # 归一化 Radius 标签
+        # 假设最大可能半径是 Alpha_max(9.0) * z_max(11) ≈ 100
+        # 将半径归一化到 [0, 1] 区间方便网络回归，预测时再乘回来
+        MAX_RADIUS = 100.0
+        radii_tensor = torch.tensor(radii, dtype=torch.float32) / MAX_RADIUS
+
+        return torch.stack(images), radii_tensor, torch.tensor(focus_pos)
