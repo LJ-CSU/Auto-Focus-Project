@@ -1,25 +1,31 @@
+import os
 import torch
 import torch.nn.functional as F
+import matplotlib.pyplot as plt
 from models.resnet_defocus import ResNetDefocus
 from loss import defocus_total_loss, DifferentiableBlurLayer, ranking_loss
 from focal_stack_dataset import DefocusSceneDataset
 from torchvision import transforms
 from torch.utils.data import DataLoader
-from eval import eval_defocus_curve
+from eval import eval_defocus_curve, eval_error_defocus
 import torch.optim as optim
+
+# 保存路径
+SAVE_DIR = "./checkpoint"
+FIG_DIR = "./figure"
 
 # 设置设备
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(f'device: {device}')
 
 # 设置超参数
-epochs = 50
+epochs = 30
 learn_rate = 1e-4
 w_radii = 10.0
-w_rank = 3.0    # 强制学习模糊程度的顺序
-w_smooth = 0.1  # 保证曲线平滑
-w_uni = 0.1     # 保证单峰性
-w_recon = 0.0   # 重构权重，按需使用，仅作为辅助正则项
+w_rank = 1.0    # 强制学习模糊程度的顺序
+w_smooth = 0.05  # 保证曲线平滑
+w_uni = 0.05     # 保证单峰性
+w_recon = 0.005   # 重构权重，按需使用，仅作为辅助正则项
 NORM_FACTOR = 100.0
 
 # 设置模型，优化器
@@ -38,18 +44,18 @@ transform = transforms.Compose([
 ])
 
 train_dataset = DefocusSceneDataset(
-    root_dir="./datasets/train_DIV2K_50",
+    root_dir="./dataset/train",
     transform=transform,
     is_train=True #是训练集
 )
 
 validate_dataset = DefocusSceneDataset(
-    root_dir="./datasets/validate",
+    root_dir="./dataset/validate",
     transform=transform,
 )
 
 test_dataset = DefocusSceneDataset(
-    root_dir="./datasets/test",
+    root_dir="./dataset/test",
     transform=transform,
 )
 
@@ -154,7 +160,15 @@ def validate(epoch):
 
     return avg_loss
 
-# 训练过程
+# 训练过程记录
+train_loss_history = []
+val_loss_history = []
+lr_history = []
+
+best_val_loss = float("inf")
+best_epoch = -1
+
+# 训练
 for epoch in range(1, epochs + 1):
     train(epoch)
     val_loss = validate(epoch)
@@ -162,13 +176,69 @@ for epoch in range(1, epochs + 1):
     current_lr = optimizer.param_groups[0]['lr']
     print(f"Epoch {epoch} | Current LR: {current_lr}")
 
+    val_loss_history.append(val_loss)
+    lr_history.append(current_lr)
+
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        best_epoch = epoch
+
+        save_path = os.path.join(SAVE_DIR, "best_model.pth")
+        torch.save({
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "val_loss": val_loss
+        }, save_path)
+
+        print(f"Best model updated at epoch {epoch}, val_loss = {val_loss:.6f}")
+
     if epoch % 5 == 0:
         images, _, focus_pos = next(iter(test_dataloader))
         images = images.squeeze(0)
         focus_pos = focus_pos.squeeze(0)
+        save_name = f'test_output/output_img_{epoch / 5}.png'
+        output_path=os.path.join(FIG_DIR, save_name)
         eval_defocus_curve(
             model,
             images,
             focus_pos,
             save_path=None
         )
+
+print("\n================ Training Finished ================")
+print(f"Best validation loss : {best_val_loss:.6f}")
+print(f"Best epoch           : {best_epoch}")
+
+# --------- Error vs Defocus Analysis ----------
+eval_error_defocus(
+    model=model,
+    dataloader=validate_dataloader,
+    device=device,
+    norm_factor=NORM_FACTOR,
+    save_path="./figure/error_vs_defocus.png"
+)
+
+# --------- Plot Validation Loss ----------
+plt.figure(figsize=(6, 4))
+plt.plot(range(1, len(val_loss_history) + 1), val_loss_history, marker='o')
+plt.xlabel("Epoch")
+plt.ylabel("Validation Loss")
+plt.title("Validation Loss Curve")
+plt.grid(True)
+plt.tight_layout()
+plt.savefig(os.path.join(FIG_DIR, "val_loss_curve.png"), dpi=150)
+plt.close()
+
+# --------- Plot Learning Rate ----------
+plt.figure(figsize=(6, 4))
+plt.plot(range(1, len(lr_history) + 1), lr_history, marker='o')
+plt.xlabel("Epoch")
+plt.ylabel("Learning Rate")
+plt.title("Learning Rate Schedule")
+plt.grid(True)
+plt.tight_layout()
+plt.savefig(os.path.join(FIG_DIR, "lr_curve.png"), dpi=150)
+plt.close()
+
+print(f"Curves saved to {FIG_DIR}")

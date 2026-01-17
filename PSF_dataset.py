@@ -120,13 +120,13 @@ def apply_jpeg_compression(image_uint8):
 
 
 def process_and_save():
-    source_images = load_images('F:/dataset/orig_pic_50')    # 原清晰图片
-    base_dir = './datasets/train_DIV2K_50'  # 生成训练图片保存路径
+    source_images = load_images('./original_data/val')    # 原清晰图片
+    base_dir = './dataset/validate_dik'  # 生成训练图片保存路径
 
     print(f"Loaded {len(source_images)} source images.")
 
     for i, img in enumerate(source_images):
-        scene_dir = os.path.join(base_dir, f'scene_{i + 26:04d}')
+        scene_dir = os.path.join(base_dir, f'scene_{i + 1:04d}')
         os.makedirs(scene_dir, exist_ok=True)
 
         # 随机设定该场景的 Alpha (模拟不同镜头)
